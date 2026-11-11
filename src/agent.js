@@ -1,14 +1,16 @@
-import { GoogleGenAI } from '@google/genai';
+import OpenAI from 'openai';
 import { buildDomTree } from './dom-tree.js';
 
 const ACTION_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['action', 'reasoning'],
+  // Azure Structured Outputs requires every property to be required. Terminal
+  // actions use null for target_id and text_value.
+  required: ['action', 'target_id', 'text_value', 'reasoning'],
   properties: {
     action: { type: 'string', enum: ['click', 'type', 'done', 'fail'] },
-    target_id: { type: 'string', description: 'The id from the current interactive-elements list. Required for click/type.' },
-    text_value: { type: 'string', description: 'Text to enter. Required for type.' },
+    target_id: { anyOf: [{ type: 'string' }, { type: 'null' }], description: 'The id from the current interactive-elements list. Required for click/type; null otherwise.' },
+    text_value: { anyOf: [{ type: 'string' }, { type: 'null' }], description: 'Text to enter. Required for type; null otherwise.' },
     reasoning: { type: 'string', description: 'Short explanation of why this is the next test action.' }
   }
 };
@@ -41,7 +43,7 @@ async function extractInteractiveElements(page) {
 }
 
 /**
- * Resolve a secret reference only at the browser boundary. Gemini receives the
+ * Resolve a secret reference only at the browser boundary. Azure OpenAI receives the
  * literal token (for example, "$PASSWORD"), never this returned value.
  * A full-value reference prevents accidental substitution inside normal text.
  */
@@ -79,67 +81,89 @@ function describeTarget(element) {
 
 function isRateLimit(error) {
   const message = `${error?.status ?? ''} ${error?.message ?? error}`.toLowerCase();
-  return error?.status === 429 || message.includes('resource_exhausted') || message.includes('rate limit') || message.includes('429');
+  return error?.status === 429 || message.includes('resource_exhausted') || message.includes('rate limit') || message.includes('too many requests') || message.includes('429');
 }
 
-async function getGeminiAction(ai, model, prompt, screenshotBase64) {
+function getAzureOpenAIClient() {
+  const apiKey = process.env.AZURE_OPENAI_API_KEY || process.env.Azure_openai_api_key;
+  const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+  if (!apiKey) throw new Error('AZURE_OPENAI_API_KEY is required. Azure_openai_api_key is also supported for compatibility.');
+  if (!endpoint) throw new Error('AZURE_OPENAI_ENDPOINT is required.');
+
+  const normalizedEndpoint = endpoint.replace(/\/+$/, '');
+  const baseURL = normalizedEndpoint.endsWith('/openai/v1')
+    ? `${normalizedEndpoint}/`
+    : `${normalizedEndpoint}/openai/v1/`;
+  return new OpenAI({ baseURL, apiKey });
+}
+
+async function getAzureOpenAIAction(client, model, prompt, screenshotBase64) {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
-      const response = await ai.models.generateContent({
+      const response = await client.chat.completions.create({
         model,
-        contents: [{
+        messages: [{
           role: 'user',
-          parts: [
-            { text: prompt },
-            { inlineData: { mimeType: 'image/png', data: screenshotBase64 } }
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: `data:image/png;base64,${screenshotBase64}`, detail: 'low' } }
           ]
         }],
-        config: {
-          responseMimeType: 'application/json',
-          responseJsonSchema: ACTION_SCHEMA,
-          temperature: 0
-        }
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'sap_browser_action',
+            strict: true,
+            schema: ACTION_SCHEMA
+          }
+        },
+        temperature: 0
       });
-      return JSON.parse(response.text);
+      const content = response.choices[0]?.message?.content;
+      if (!content) {
+        const refusal = response.choices[0]?.message?.refusal;
+        throw new Error(refusal ? `Azure OpenAI refused the action request: ${refusal}` : 'Azure OpenAI returned no action content.');
+      }
+      return JSON.parse(content);
     } catch (error) {
       if (!isRateLimit(error) || attempt === 4) throw error;
       const waitMs = 2_000 * (2 ** attempt);
-      console.warn(`Gemini rate-limited; retrying in ${waitMs}ms (${attempt + 1}/5)`);
+      console.warn(`Azure OpenAI rate-limited; retrying in ${waitMs}ms (${attempt + 1}/5)`);
       await sleep(waitMs);
     }
   }
 }
 
 function validateAction(action, elements) {
-  if (!['click', 'type', 'done', 'fail'].includes(action?.action)) throw new Error('Gemini returned an unsupported action.');
+  if (!['click', 'type', 'done', 'fail'].includes(action?.action)) throw new Error('Azure OpenAI returned an unsupported action.');
   if (['click', 'type'].includes(action.action)) {
     if (!action.target_id || !elements.some((element) => element.id === action.target_id)) {
-      throw new Error(`Gemini selected unknown target_id: ${action.target_id}`);
+      throw new Error(`Azure OpenAI selected unknown target_id: ${action.target_id}`);
     }
     if (action.action === 'type' && typeof action.text_value !== 'string') {
-      throw new Error('Gemini chose type without text_value.');
+      throw new Error('Azure OpenAI chose type without text_value.');
     }
     if (action.action === 'type' && !elements.find((element) => element.id === action.target_id)?.editable) {
-      throw new Error(`Gemini selected non-editable target_id for type: ${action.target_id}`);
+      throw new Error(`Azure OpenAI selected non-editable target_id for type: ${action.target_id}`);
     }
   }
 }
 
-async function requestValidatedAction({ ai, model, prompt, screenshot, elements }) {
+async function requestValidatedAction({ client, model, prompt, screenshot, elements }) {
   let correction = '';
   let lastError;
 
   // An LLM can occasionally hallucinate an id despite structured output. Retry
   // against the same observation before discarding it and rebuilding the tree.
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const action = await getGeminiAction(ai, model, `${prompt}${correction}`, screenshot);
+    const action = await getAzureOpenAIAction(client, model, `${prompt}${correction}`, screenshot);
     try {
       validateAction(action, elements);
       return { action };
     } catch (error) {
       lastError = error;
       const validIds = elements.map((element) => element.id).join(', ');
-      console.warn(`Invalid Gemini action (attempt ${attempt + 1}/3): ${error.message}`);
+      console.warn(`Invalid Azure OpenAI action (attempt ${attempt + 1}/3): ${error.message}`);
       correction = `\n\nYour previous response was invalid: ${error.message} ` +
         `Return a corrected action now. Valid target_id values are only: ${validIds || '(none)'}.`;
     }
@@ -153,7 +177,7 @@ async function performAction(page, action, element, frame) {
   const selector = `[data-sap-ai-id="${action.target_id}"]`;
 
   try {
-    // Navigation can replace an iframe while Gemini is deciding. Frame access
+    // Navigation can replace an iframe while Azure OpenAI is deciding. Frame access
     // itself then throws before an ElementHandle can be queried.
     if (!frame) return { executed: false, result: 'target_frame_unavailable' };
     const target = await frame.$(selector);
@@ -207,9 +231,8 @@ async function performAction(page, action, element, frame) {
 }
 
 export async function runSapTestAgent({ page, url, goal, maxSteps, model, artifactDir }) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY is required. Add it to .env (see .env.example).');
-  const ai = new GoogleGenAI({ apiKey });
+  const client = getAzureOpenAIClient();
+  if (!model) throw new Error('AZURE_OPENAI_DEPLOYMENT is required. AZURE_OPENAI_MODEL is accepted as an alias.');
   const history = [];
   let failRecheckCount = 0;
 
@@ -231,10 +254,10 @@ export async function runSapTestAgent({ page, url, goal, maxSteps, model, artifa
       'copy that reference verbatim into text_value; it will be resolved privately at execution time. ' +
       'Never ask for, infer, or reveal the value of a secret reference. ' +
       'Use done only when the goal has been verified, fail when it cannot be completed. Do not submit destructive business actions unless the goal explicitly requires it.';
-    const decision = await requestValidatedAction({ ai, model, prompt, screenshot, elements });
+    const decision = await requestValidatedAction({ client, model, prompt, screenshot, elements });
     if (!decision.action) {
       history.push({ action: { action: 'invalid_model_response' }, result: 'no_valid_target_id' });
-      console.warn(`Step ${step}: Gemini did not select a valid current target; rebuilding the DOM tree.`);
+      console.warn(`Step ${step}: Azure OpenAI did not select a valid current target; rebuilding the DOM tree.`);
       await sleep(500);
       continue;
     }
@@ -249,7 +272,7 @@ export async function runSapTestAgent({ page, url, goal, maxSteps, model, artifa
       if (failRecheckCount < MAX_FAIL_RECHECKS) {
         failRecheckCount += 1;
         history.push({ action, result: 'fail_recheck_requested' });
-        console.warn(`Step ${step}: Gemini returned fail; waiting for UI5 and taking fresh DOM/screenshot observation ${failRecheckCount}/${MAX_FAIL_RECHECKS}.`);
+      console.warn(`Step ${step}: Azure OpenAI returned fail; waiting for UI5 and taking fresh DOM/screenshot observation ${failRecheckCount}/${MAX_FAIL_RECHECKS}.`);
         await sleep(2_000);
         continue;
       }

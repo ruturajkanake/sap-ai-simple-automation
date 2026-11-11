@@ -19,7 +19,7 @@ try {
   await page.setViewport({ width: 1440, height: 1000, deviceScaleFactor: 1 });
   const result = await runSapTestAgent({
     page, url, goal, artifactDir,
-    model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+    model: process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL,
     maxSteps: Number(process.env.MAX_STEPS || 25)
   });
   await fs.writeFile(path.join(artifactDir, 'result.json'), JSON.stringify(result, null, 2));

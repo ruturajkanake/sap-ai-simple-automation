@@ -3,17 +3,17 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "SAP UI5 browser testing agent driven by Gemini Flash-Lite",
+  "description": "SAP UI5 browser testing agent driven by Azure OpenAI",
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
-    "@google/genai": "^1.0.0",
     "dotenv": "^16.4.7",
+    "openai": "^6.0.0",
     "puppeteer": "^24.0.0"
   }
 }
