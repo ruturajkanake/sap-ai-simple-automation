@@ -86,15 +86,26 @@ function isRateLimit(error) {
 
 function getAzureOpenAIClient() {
   const apiKey = process.env.AZURE_OPENAI_API_KEY || process.env.Azure_openai_api_key;
-  const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+  const endpoint = process.env.AZURE_OPENAI_BASE_URL || process.env.AZURE_OPENAI_ENDPOINT;
   if (!apiKey) throw new Error('AZURE_OPENAI_API_KEY is required. Azure_openai_api_key is also supported for compatibility.');
   if (!endpoint) throw new Error('AZURE_OPENAI_ENDPOINT is required.');
 
   const normalizedEndpoint = endpoint.replace(/\/+$/, '');
-  const baseURL = normalizedEndpoint.endsWith('/openai/v1')
-    ? `${normalizedEndpoint}/`
-    : `${normalizedEndpoint}/openai/v1/`;
-  return new OpenAI({ baseURL, apiKey });
+  const isAzureResourceRoot = /^https:\/\/[^/]+\.(openai\.azure\.com|services\.ai\.azure\.com)$/i.test(normalizedEndpoint);
+  // Standard Azure resource roots need the v1 suffix. Corporate API gateways
+  // (for example, https://orgname.com/openai-chat/) already include their
+  // routing path and must be used exactly as supplied.
+  const baseURL = isAzureResourceRoot && !normalizedEndpoint.endsWith('/openai/v1')
+    ? `${normalizedEndpoint}/openai/v1/`
+    : `${normalizedEndpoint}/`;
+  return new OpenAI({
+    baseURL,
+    apiKey,
+    // Direct Azure resources use `api-key`. Corporate Azure API Management
+    // gateways commonly require `Ocp-Apim-Subscription-Key`. Keep it explicit
+    // because the generic SDK otherwise formats a static apiKey as Bearer.
+    defaultHeaders: { 'Ocp-Apim-Subscription-Key': apiKey, 'api-key': apiKey }
+  });
 }
 
 async function getAzureOpenAIAction(client, model, prompt, screenshotBase64) {
