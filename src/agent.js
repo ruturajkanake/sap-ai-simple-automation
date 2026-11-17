@@ -1,16 +1,19 @@
 import OpenAI from 'openai';
+import { stat } from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
 import { buildDomTree } from './dom-tree.js';
 
 const ACTION_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   // Azure Structured Outputs requires every property to be required. Terminal
-  // actions use null for target_id and text_value.
-  required: ['action', 'target_id', 'text_value', 'reasoning'],
+  // actions use null for target_id, text_value, and file_path.
+  required: ['action', 'target_id', 'text_value', 'file_path', 'reasoning'],
   properties: {
-    action: { type: 'string', enum: ['click', 'type', 'done', 'fail'] },
-    target_id: { anyOf: [{ type: 'string' }, { type: 'null' }], description: 'The id from the current interactive-elements list. Required for click/type; null otherwise.' },
+    action: { type: 'string', enum: ['click', 'type', 'upload', 'done', 'fail'] },
+    target_id: { anyOf: [{ type: 'string' }, { type: 'null' }], description: 'The id from the current interactive-elements list. Required for click/type/upload; null otherwise.' },
     text_value: { anyOf: [{ type: 'string' }, { type: 'null' }], description: 'Text to enter. Required for type; null otherwise.' },
+    file_path: { anyOf: [{ type: 'string' }, { type: 'null' }], description: 'A complete environment-variable reference such as $UPLOAD_FILE. Required for upload; null otherwise.' },
     reasoning: { type: 'string', description: 'Short explanation of why this is the next test action.' }
   }
 };
@@ -62,6 +65,23 @@ function resolveTextValue(textValue) {
   return value;
 }
 
+async function resolveUploadFile(fileReference) {
+  if (!/^\$[A-Z_][A-Z0-9_]*$/.test(fileReference)) {
+    throw new Error('Upload file_path must be a complete environment-variable reference, such as $UPLOAD_FILE.');
+  }
+  const resolvedPath = resolvePath(resolveTextValue(fileReference));
+  let metadata;
+  try {
+    metadata = await stat(resolvedPath);
+  } catch {
+    throw new Error(`The local file referenced by ${fileReference} does not exist or cannot be read.`);
+  }
+  if (!metadata.isFile()) {
+    throw new Error(`The value referenced by ${fileReference} is not a file.`);
+  }
+  return resolvedPath;
+}
+
 function describeTextSource(textValue) {
   const match = /^\$([A-Z_][A-Z0-9_]*)$/.exec(textValue);
   if (!match) return `literal value (${textValue.length} characters)`;
@@ -69,6 +89,11 @@ function describeTextSource(textValue) {
   if (value === undefined) return `$${match[1]} (missing)`;
   if (value.length === 0) return `$${match[1]} (empty)`;
   return `$${match[1]} (resolved, ${value.length} characters)`;
+}
+
+function describeFileSource(fileReference) {
+  const match = /^\$([A-Z_][A-Z0-9_]*)$/.exec(fileReference);
+  return match ? `$${match[1]} (local file reference)` : 'invalid file reference';
 }
 
 function describeTarget(element) {
@@ -146,8 +171,8 @@ async function getAzureOpenAIAction(client, model, prompt, screenshotBase64) {
 }
 
 function validateAction(action, elements) {
-  if (!['click', 'type', 'done', 'fail'].includes(action?.action)) throw new Error('Azure OpenAI returned an unsupported action.');
-  if (['click', 'type'].includes(action.action)) {
+  if (!['click', 'type', 'upload', 'done', 'fail'].includes(action?.action)) throw new Error('Azure OpenAI returned an unsupported action.');
+  if (['click', 'type', 'upload'].includes(action.action)) {
     if (!action.target_id || !elements.some((element) => element.id === action.target_id)) {
       throw new Error(`Azure OpenAI selected unknown target_id: ${action.target_id}`);
     }
@@ -156,6 +181,15 @@ function validateAction(action, elements) {
     }
     if (action.action === 'type' && !elements.find((element) => element.id === action.target_id)?.editable) {
       throw new Error(`Azure OpenAI selected non-editable target_id for type: ${action.target_id}`);
+    }
+    if (action.action === 'upload' && typeof action.file_path !== 'string') {
+      throw new Error('Azure OpenAI chose upload without file_path.');
+    }
+    if (action.action === 'upload' && !/^\$[A-Z_][A-Z0-9_]*$/.test(action.file_path)) {
+      throw new Error('Azure OpenAI must use a complete environment-variable reference for upload file_path.');
+    }
+    if (action.action === 'upload' && !elements.find((element) => element.id === action.target_id)?.uploadable) {
+      throw new Error(`Azure OpenAI selected non-uploadable target_id for upload: ${action.target_id}`);
     }
   }
 }
@@ -197,6 +231,8 @@ async function performAction(page, action, element, frame) {
       console.log(`[Puppeteer] clicking #${action.target_id} (${describeTarget(element)})`);
     } else if (action.action === 'type') {
       console.log(`[Puppeteer] typing into #${action.target_id} (${describeTarget(element)}), source: ${describeTextSource(action.text_value)}`);
+    } else if (action.action === 'upload') {
+      console.log(`[Puppeteer] uploading to #${action.target_id} (${describeTarget(element)}), source: ${describeFileSource(action.file_path)}`);
     }
     // UI5 virtualized content and sticky containers can make an otherwise valid
     // DOM node temporarily outside Puppeteer's clickable viewport.
@@ -221,6 +257,14 @@ async function performAction(page, action, element, frame) {
       // UI5 listens to input/change; blur ensures the change handler is committed.
       await target.evaluate((element) => element.dispatchEvent(new Event('change', { bubbles: true })));
       await page.keyboard.press('Tab');
+    } else if (action.action === 'upload') {
+      const filePath = await resolveUploadFile(action.file_path);
+      await target.uploadFile(filePath);
+      // Explicitly notify UI5 controls after CDP updates the file input.
+      await target.evaluate((element) => {
+        element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      });
     }
     return { executed: true, result: 'executed' };
   } catch (error) {
@@ -261,6 +305,8 @@ export async function runSapTestAgent({ page, url, goal, maxSteps, model, artifa
       `Previous actions: ${JSON.stringify(recentHistory)}\n\n` +
       'Choose exactly one safe next action. Use only a target_id from the current list. ' +
       'For a type action, select only an element with editable: true; never type into a link, button, or UI5 wrapper. ' +
+      'For an upload action, select only an element with uploadable: true and copy a file reference such as $UPLOAD_FILE verbatim into file_path. ' +
+      'Never request, infer, or reveal the actual local file path. ' +
       'If the testing goal contains a secret reference such as $USERNAME or $PASSWORD, ' +
       'copy that reference verbatim into text_value; it will be resolved privately at execution time. ' +
       'Never ask for, infer, or reveal the value of a secret reference. ' +

@@ -17,7 +17,8 @@ export function buildDomTree(idPrefix = '') {
 
   const textOf = (element) =>
     (element.getAttribute('aria-label') || element.getAttribute('title') ||
-      element.getAttribute('placeholder') || element.innerText || element.value || '')
+      element.getAttribute('placeholder') || element.innerText ||
+      (element.type === 'file' ? '' : element.value) || '')
       .replace(/\s+/g, ' ').trim().slice(0, 160);
 
   const visible = (element) => {
@@ -30,8 +31,10 @@ export function buildDomTree(idPrefix = '') {
   // UI5 often places the listener/role on a wrapper. Keep the actual matching
   // element so click and type can use a deterministic attribute selector.
   const nodes = [...document.querySelectorAll(INTERACTIVE_SELECTOR)]
-    .filter(visible)
-    .filter((element) => !element.closest('[aria-hidden="true"]'));
+    // Native file inputs are frequently visually hidden behind a styled upload
+    // button. They remain safe and usable through Puppeteer's uploadFile().
+    .filter((element) => element.matches('input[type="file"]') || visible(element))
+    .filter((element) => element.matches('input[type="file"]') || !element.closest('[aria-hidden="true"]'));
 
   document.querySelectorAll(`[${ID_ATTRIBUTE}]`).forEach((element) =>
     element.removeAttribute(ID_ATTRIBUTE));
@@ -53,10 +56,11 @@ export function buildDomTree(idPrefix = '') {
         element.matches('textarea:not([readonly]):not([disabled])') ||
         element.getAttribute('contenteditable') === 'true'
       ),
+      uploadable: element.matches('input[type="file"]:not([disabled])'),
       name: textOf(element) || undefined,
       disabled: element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true',
       checked: element.getAttribute('aria-checked') || element.checked || undefined,
-      value: ['password'].includes(element.type) ? undefined : (element.value || undefined),
+      value: ['password', 'file'].includes(element.type) ? undefined : (element.value || undefined),
       bounds: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) }
     };
   });
